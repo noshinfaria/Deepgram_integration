@@ -1,0 +1,4 @@
+{"type": "ConversationText", "role": "assistant", "content": "Hello! How can I help you today?"}
+{"type": "ConversationText", "role": "user", "content": "Hello? Can you hear me?"}
+{"type": "ConversationText", "role": "assistant", "content": "Hello!"}
+{"type": "ConversationText", "role": "assistant", "content": "I can \"hear\" you in the sense that I can read your messages."}

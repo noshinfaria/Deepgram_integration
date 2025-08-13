@@ -1,0 +1,483 @@
+"""
+FastAPI app for Agent management + single interact API that supports:
+- Text chat
+- Voice calls (upload/prerecorded) via Deepgram STT
+- TTS reply via Deepgram Speak
+- Session creation + recording storage + transcript retrieval
+
+Run:
+  pip install fastapi uvicorn sqlalchemy pydantic-settings python-multipart deepgram-sdk aiofiles
+  export DEEPGRAM_API_KEY=...  # or set in .env
+  uvicorn app:app --reload
+
+Notes:
+- For simplicity, this is a single-file app. Move models/routers as needed.
+- Deepgram usage follows their docs (STT prerecorded + TTS REST). Replace the dummy LLM with your own.
+"""
+from __future__ import annotations
+
+import os
+import json
+import uuid
+from datetime import datetime
+from typing import Optional, List, Literal
+
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from pydantic import BaseModel
+from pydantic_settings import BaseSettings
+
+from sqlalchemy import (
+    create_engine, Column, Integer, String, ForeignKey, DateTime, Float, Boolean, Text
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
+
+import aiofiles
+
+# Deepgram SDK (async)
+from deepgram import Deepgram
+
+# -----------------------------
+# Settings
+# -----------------------------
+class Settings(BaseSettings):
+    DATABASE_URL: str = "sqlite+aiosqlite:///./agent.db"  # use aiosqlite if switching to async ORM; here we'll use sync sqlite
+    SYNC_DATABASE_URL: str = "sqlite:///./agent.db"
+    STORAGE_DIR: str = "./storage"
+    DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
+
+settings = Settings()
+
+# Ensure storage folders
+os.makedirs(settings.STORAGE_DIR, exist_ok=True)
+REC_DIR = os.path.join(settings.STORAGE_DIR, "recordings")
+TTS_DIR = os.path.join(settings.STORAGE_DIR, "tts")
+TRANSCRIPTS_DIR = os.path.join(settings.STORAGE_DIR, "transcripts")
+for d in (REC_DIR, TTS_DIR, TRANSCRIPTS_DIR):
+    os.makedirs(d, exist_ok=True)
+
+# -----------------------------
+# Database (SQLAlchemy sync for simplicity)
+# -----------------------------
+engine = create_engine(settings.SYNC_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# -----------------------------
+# Models
+# -----------------------------
+class AgentType(Base):
+    __tablename__ = "agent_types"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(50), unique=True, nullable=False)
+
+class Industry(Base):
+    __tablename__ = "industries"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), unique=True, nullable=False)
+
+class UseCase(Base):
+    __tablename__ = "use_cases"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    agent_type_id = Column(Integer, ForeignKey("agent_types.id"), nullable=False)
+    industry_id = Column(Integer, ForeignKey("industries.id"), nullable=True)
+
+class Agent(Base):
+    __tablename__ = "agents"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    agent_type_id = Column(Integer, ForeignKey("agent_types.id"), nullable=False)
+    industry_id = Column(Integer, ForeignKey("industries.id"), nullable=True)
+    use_case_id = Column(Integer, ForeignKey("use_cases.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class ChatConfig(Base):
+    __tablename__ = "chat_configs"
+    id = Column(Integer, primary_key=True)
+    agent_id = Column(Integer, ForeignKey("agents.id"), unique=True, nullable=False)
+    welcome_message = Column(Text, default="Hello! How can I help?")
+    temperature = Column(Float, default=0.7)
+    tone = Column(String(50), default="friendly")
+    model = Column(String(50), default="dummy-llm")
+
+class VoiceConfig(Base):
+    __tablename__ = "voice_configs"
+    id = Column(Integer, primary_key=True)
+    agent_id = Column(Integer, ForeignKey("agents.id"), unique=True, nullable=False)
+    tts_provider = Column(String(50), default="deepgram")
+    voice_name = Column(String(50), default="aura-asteria-en")  # Deepgram Aura voice id (example)
+    language = Column(String(10), default="en-US")
+    enable_stt = Column(Boolean, default=True)
+
+class KnowledgeBase(Base):
+    __tablename__ = "knowledge_bases"
+    id = Column(Integer, primary_key=True)
+    agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
+    kb_type = Column(String(50), default="url")
+    source_url = Column(Text, nullable=True)
+    last_synced = Column(DateTime, default=datetime.utcnow)
+
+class WidgetConfig(Base):
+    __tablename__ = "widget_configs"
+    id = Column(Integer, primary_key=True)
+    agent_id = Column(Integer, ForeignKey("agents.id"), unique=True, nullable=False)
+    embed_code = Column(Text, default="")
+    theme = Column(String(50), default="light")
+    position = Column(String(20), default="bottom-right")
+    custom_css = Column(Text, default="")
+
+class SessionModel(Base):
+    __tablename__ = "sessions"
+    id = Column(String(64), primary_key=True)  # session_id
+    agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
+    user_id = Column(String(128), nullable=True)
+    mode = Column(String(10), nullable=False)  # chat|call
+    started_at = Column(DateTime, default=datetime.utcnow)
+    ended_at = Column(DateTime, nullable=True)
+    recording_path = Column(Text, nullable=True)
+    tts_path = Column(Text, nullable=True)
+    transcript_path = Column(Text, nullable=True)
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# -----------------------------
+# Pydantic Schemas
+# -----------------------------
+class AgentCreate(BaseModel):
+    name: str
+    agent_type_id: int
+    industry_id: Optional[int] = None
+    use_case_id: int
+
+class AgentOut(BaseModel):
+    id: int
+    name: str
+    agent_type_id: int
+    industry_id: Optional[int] = None
+    use_case_id: int
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+class ChatConfigIn(BaseModel):
+    welcome_message: str = "Hello! How can I help you today?"
+    temperature: float = 0.7
+    tone: str = "friendly"
+    model: str = "gpt-4o"  # replace with your model
+
+class VoiceConfigIn(BaseModel):
+    tts_provider: str = "deepgram"
+    voice_name: str = "aura-asteria-en"
+    language: str = "en-US"
+    enable_stt: bool = True
+
+class KnowledgeBaseIn(BaseModel):
+    kb_type: str = "url"
+    source_url: Optional[str] = None
+
+class WidgetConfigIn(BaseModel):
+    embed_code: str = "<script src=\"/widget.js\"></script>"
+    theme: str = "light"
+    position: str = "bottom-right"
+    custom_css: str = ""
+
+class SessionCreateIn(BaseModel):
+    mode: Literal["chat", "call"]
+    user_id: Optional[str] = None
+
+class SessionOut(BaseModel):
+    session_id: str
+    agent_id: int
+    mode: str
+    user_id: Optional[str]
+    started_at: datetime
+
+class TranscriptOut(BaseModel):
+    session_id: str
+    transcript: List[dict]
+
+# -----------------------------
+# App + DI
+# -----------------------------
+app = FastAPI(title="Agent API with Deepgram Recording")
+
+def get_db() -> Session:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Deepgram client (async)
+deepgram = Deepgram(settings.DEEPGRAM_API_KEY) if settings.DEEPGRAM_API_KEY else None
+
+# -----------------------------
+# Utilities
+# -----------------------------
+async def transcribe_with_deepgram(content: bytes, mimetype: str = "audio/wav") -> str:
+    if not deepgram:
+        # Fallback: pretend transcription
+        return "(transcription unavailable)"
+    source = {"buffer": content, "mimetype": mimetype}
+    options = {"smart_format": True, "punctuate": True, "model": "nova-2"}
+    result = await deepgram.transcription.prerecorded(source, options)
+    # Extract top transcript
+    try:
+        return result["results"]["channels"][0]["alternatives"][0]["transcript"]
+    except Exception:
+        return ""
+
+async def tts_with_deepgram(text: str, voice: str = "aura-asteria-en") -> str:
+    """Generate TTS mp3 and return its filepath."""
+    if not deepgram:
+        # Create a dummy file to keep flow uniform
+        out_path = os.path.join(TTS_DIR, f"{uuid.uuid4().hex}.txt")
+        async with aiofiles.open(out_path, "w") as f:
+            await f.write(text)
+        return out_path
+    # Save to file via SDK speak API
+    out_path = os.path.join(TTS_DIR, f"{uuid.uuid4().hex}.mp3")
+    # The SDK v3 uses: await deepgram.speak.v("1").save(filename, options)
+    await deepgram.speak.v("1").save(out_path, {"text": text, "voice": voice})
+    return out_path
+
+def dummy_llm_response(prompt: str, temperature: float = 0.7, tone: str = "friendly") -> str:
+    # Replace this with a real LLM call (OpenAI, etc.)
+    prefix = {
+        "friendly": "Sure! ",
+        "formal": "Certainly. ",
+        "concise": "",
+    }.get(tone, "")
+    return f"{prefix}You said: {prompt}"
+
+# -----------------------------
+# Endpoints: Agents & Configs
+# -----------------------------
+@app.post("/agents", response_model=AgentOut, status_code=201)
+def create_agent(payload: AgentCreate, db: Session = Depends(get_db)):
+    # Basic validation left minimal; ensure FKs exist in production
+    agent = Agent(
+        name=payload.name,
+        agent_type_id=payload.agent_type_id,
+        industry_id=payload.industry_id,
+        use_case_id=payload.use_case_id,
+    )
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+    return agent
+
+@app.post("/agents/{agent_id}/chat-config", status_code=201)
+def set_chat_config(agent_id: int, cfg: ChatConfigIn, db: Session = Depends(get_db)):
+    agent = db.get(Agent, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    existing = db.query(ChatConfig).filter_by(agent_id=agent_id).first()
+    if existing:
+        existing.welcome_message = cfg.welcome_message
+        existing.temperature = cfg.temperature
+        existing.tone = cfg.tone
+        existing.model = cfg.model
+        db.commit()
+        return {"id": existing.id, "agent_id": agent_id, **cfg.model_dump()}
+    row = ChatConfig(agent_id=agent_id, **cfg.model_dump())
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"id": row.id, "agent_id": agent_id, **cfg.model_dump()}
+
+@app.post("/agents/{agent_id}/voice-config", status_code=201)
+def set_voice_config(agent_id: int, cfg: VoiceConfigIn, db: Session = Depends(get_db)):
+    agent = db.get(Agent, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    existing = db.query(VoiceConfig).filter_by(agent_id=agent_id).first()
+    if existing:
+        existing.tts_provider = cfg.tts_provider
+        existing.voice_name = cfg.voice_name
+        existing.language = cfg.language
+        existing.enable_stt = cfg.enable_stt
+        db.commit()
+        return {"id": existing.id, "agent_id": agent_id, **cfg.model_dump()}
+    row = VoiceConfig(agent_id=agent_id, **cfg.model_dump())
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"id": row.id, "agent_id": agent_id, **cfg.model_dump()}
+
+@app.post("/agents/{agent_id}/knowledge-base", status_code=201)
+def add_kb(agent_id: int, kb: KnowledgeBaseIn, db: Session = Depends(get_db)):
+    agent = db.get(Agent, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    row = KnowledgeBase(agent_id=agent_id, kb_type=kb.kb_type, source_url=kb.source_url)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {
+        "id": row.id,
+        "agent_id": agent_id,
+        "kb_type": row.kb_type,
+        "source_url": row.source_url,
+        "last_synced": row.last_synced.isoformat(),
+    }
+
+@app.post("/agents/{agent_id}/widget-config", status_code=201)
+def set_widget(agent_id: int, cfg: WidgetConfigIn, db: Session = Depends(get_db)):
+    agent = db.get(Agent, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    existing = db.query(WidgetConfig).filter_by(agent_id=agent_id).first()
+    if existing:
+        existing.embed_code = cfg.embed_code
+        existing.theme = cfg.theme
+        existing.position = cfg.position
+        existing.custom_css = cfg.custom_css
+        db.commit()
+        return {"id": existing.id, "agent_id": agent_id, **cfg.model_dump()}
+    row = WidgetConfig(agent_id=agent_id, **cfg.model_dump())
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"id": row.id, "agent_id": agent_id, **cfg.model_dump()}
+
+# -----------------------------
+# Sessions
+# -----------------------------
+@app.post("/agents/{agent_id}/session", response_model=SessionOut, status_code=201)
+def start_session(agent_id: int, payload: SessionCreateIn, db: Session = Depends(get_db)):
+    agent = db.get(Agent, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    sess_id = uuid.uuid4().hex
+    row = SessionModel(id=sess_id, agent_id=agent_id, user_id=payload.user_id, mode=payload.mode)
+    db.add(row)
+    db.commit()
+    return SessionOut(session_id=sess_id, agent_id=agent_id, mode=payload.mode, user_id=payload.user_id, started_at=row.started_at)
+
+# -----------------------------
+# Single Interact API (chat OR call)
+# -----------------------------
+@app.post("/agent/{agent_id}/interact")
+async def interact(
+    agent_id: int,
+    text: Optional[str] = Form(None),
+    audio: Optional[UploadFile] = File(None),
+    session_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    agent = db.get(Agent, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+
+    chat_cfg: ChatConfig | None = db.query(ChatConfig).filter_by(agent_id=agent_id).first()
+    voice_cfg: VoiceConfig | None = db.query(VoiceConfig).filter_by(agent_id=agent_id).first()
+
+    # Ensure session exists or create ephemeral one
+    if session_id:
+        sess = db.get(SessionModel, session_id)
+        if not sess:
+            raise HTTPException(404, "Session not found")
+    else:
+        sess = SessionModel(id=uuid.uuid4().hex, agent_id=agent_id, mode="chat" if text else "call")
+        db.add(sess)
+        db.commit()
+
+    # TEXT MODE
+    if text is not None:
+        reply = dummy_llm_response(text, temperature=(chat_cfg.temperature if chat_cfg else 0.7), tone=(chat_cfg.tone if chat_cfg else "friendly"))
+        # Optionally TTS
+        tts_path = None
+        if voice_cfg and voice_cfg.tts_provider == "deepgram":
+            tts_path = await tts_with_deepgram(reply, voice=voice_cfg.voice_name)
+            sess.tts_path = tts_path
+            db.commit()
+        return {
+            "mode": "chat",
+            "session_id": sess.id,
+            "response_text": reply,
+            "tts_file": tts_path,
+        }
+
+    # AUDIO MODE
+    if audio is not None:
+        # Save uploaded audio as the recording
+        file_ext = os.path.splitext(audio.filename or "recording.wav")[1] or ".wav"
+        rec_path = os.path.join(REC_DIR, f"{uuid.uuid4().hex}{file_ext}")
+        content = await audio.read()
+        async with aiofiles.open(rec_path, "wb") as f:
+            await f.write(content)
+
+        sess.mode = "call"
+        sess.recording_path = rec_path
+
+        # STT via Deepgram
+        transcript_text = await transcribe_with_deepgram(content, mimetype=audio.content_type or "audio/wav")
+
+        # Store transcript JSON
+        transcript_data = [{"speaker": "user", "text": transcript_text}]
+        transcript_path = os.path.join(TRANSCRIPTS_DIR, f"{uuid.uuid4().hex}.json")
+        async with aiofiles.open(transcript_path, "w") as f:
+            await f.write(json.dumps(transcript_data, ensure_ascii=False))
+
+        sess.transcript_path = transcript_path
+
+        # LLM reply
+        reply_text = dummy_llm_response(transcript_text, temperature=(chat_cfg.temperature if chat_cfg else 0.7), tone=(chat_cfg.tone if chat_cfg else "friendly"))
+
+        # TTS reply
+        tts_path = None
+        if voice_cfg and voice_cfg.tts_provider == "deepgram":
+            tts_path = await tts_with_deepgram(reply_text, voice=voice_cfg.voice_name)
+            sess.tts_path = tts_path
+
+        db.commit()
+
+        # Return both text and (optional) audio
+        resp = {
+            "mode": "call",
+            "session_id": sess.id,
+            "response_text": reply_text,
+            "recording_file": rec_path,
+            "transcript_file": transcript_path,
+            "tts_file": tts_path,
+        }
+        return JSONResponse(resp)
+
+    raise HTTPException(400, "Either 'text' or 'audio' must be provided")
+
+# -----------------------------
+# Retrieve Recording / Transcript / TTS
+# -----------------------------
+@app.get("/sessions/{session_id}/recording")
+def get_recording(session_id: str, db: Session = Depends(get_db)):
+    sess = db.get(SessionModel, session_id)
+    if not sess or not sess.recording_path or not os.path.exists(sess.recording_path):
+        raise HTTPException(404, "Recording not found")
+    return FileResponse(sess.recording_path)
+
+@app.get("/sessions/{session_id}/tts")
+def get_tts(session_id: str, db: Session = Depends(get_db)):
+    sess = db.get(SessionModel, session_id)
+    if not sess or not sess.tts_path or not os.path.exists(sess.tts_path):
+        raise HTTPException(404, "TTS file not found")
+    # If it's an mp3 return as audio/mpeg, else default
+    media_type = "audio/mpeg" if sess.tts_path.endswith(".mp3") else "text/plain"
+    return FileResponse(sess.tts_path, media_type=media_type)
+
+@app.get("/sessions/{session_id}/transcript", response_model=TranscriptOut)
+async def get_transcript(session_id: str, db: Session = Depends(get_db)):
+    sess = db.get(SessionModel, session_id)
+    if not sess or not sess.transcript_path or not os.path.exists(sess.transcript_path):
+        raise HTTPException(404, "Transcript not found")
+    async with aiofiles.open(sess.transcript_path, "r") as f:
+        data = await f.read()
+    return TranscriptOut(session_id=session_id, transcript=json.loads(data))
+
+# Root
+@app.get("/")
+def root():
+    return {"ok": True, "service": "Agent API + Deepgram", "docs": "/docs"}
+
